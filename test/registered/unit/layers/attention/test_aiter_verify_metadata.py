@@ -262,7 +262,7 @@ class _MHAPool:
         return torch.empty(1, 1, 8, 128)
 
 
-def _init_mha_backend(kv_cache_layout):
+def _init_mha_backend(kv_cache_layout, speculative_algorithm=None):
     pool = _MHAPool(kv_cache_layout)
     model_config = SimpleNamespace(
         dtype=torch.bfloat16,
@@ -289,6 +289,7 @@ def _init_mha_backend(kv_cache_layout):
         speculative_num_draft_tokens=None,
         speculative_num_steps=None,
         speculative_eagle_topk=None,
+        speculative_algorithm=speculative_algorithm,
     )
     parallel = SimpleNamespace(attn_tp_size=1, attn_dcp_size=1)
     exec_config = SimpleNamespace(
@@ -315,6 +316,75 @@ class TestAiterDecodeWorkspace(CustomTestCase):
             for layout in ("nhd", "vectorized_5d")
         }
         self.assertEqual(allocated, {"nhd": True, "vectorized_5d": False})
+
+
+_MASK_LEN = 6
+
+
+def _dense_verify_backend(dspark):
+    """A dense (non-MLA) backend on the non-unified target-verify path, the only
+    path that builds a custom_mask into the CUDA graph."""
+    backend = _unified_verify_backend()
+    backend._use_unified_verify = False
+    backend._dspark_verify = dspark
+    backend.max_kv_len = backend.max_context_len
+    backend.mask_indptr = torch.zeros(_BATCH_SIZE + 1, dtype=torch.int64)
+    backend.cuda_graph_custom_mask = torch.zeros(16, dtype=torch.uint8)
+    return backend
+
+
+class TestAiterDsparkGraphVerifyMask(CustomTestCase):
+    """DSpark verify never builds a custom_mask, but CUDA-graph capture passes a
+    dummy non-None one. The mask must be chosen from config, not from that tensor,
+    so capture and replay both use no mask; other speculative methods keep copying
+    their real mask into the graph buffer."""
+
+    def setUp(self):
+        for target, replacement in (
+            ("reset_verify_attn_plan_cache", lambda: None),
+            ("create_flashinfer_kv_indices_triton", _NoopKernel()),
+        ):
+            patcher = patch.object(aiter_backend, target, replacement, create=True)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _custom_mask(self, backend, custom_mask, in_capture):
+        forward_batch = _verify_batch()
+        forward_batch.spec_info = SimpleNamespace(
+            draft_token_num=_VERIFY_TOKENS_PER_REQ - 1, custom_mask=custom_mask
+        )
+        backend.init_forward_metadata_out_graph(forward_batch, in_capture=in_capture)
+        return backend.forward_metadata.custom_mask
+
+    def test_dspark_has_no_mask_at_capture_or_replay(self):
+        backend = _dense_verify_backend(dspark=True)
+        dummy_mask = torch.ones(_MASK_LEN, dtype=torch.uint8)
+
+        self.assertIsNone(self._custom_mask(backend, dummy_mask, in_capture=True))
+        self.assertIsNone(self._custom_mask(backend, None, in_capture=False))
+        # The graph's mask buffer is never written, so replay cannot read it stale.
+        self.assertFalse(backend.cuda_graph_custom_mask.any())
+
+    def test_real_mask_is_copied_into_the_graph_buffer(self):
+        backend = _dense_verify_backend(dspark=False)
+        mask = torch.tensor([1, 0, 1, 1, 0, 1], dtype=torch.uint8)
+
+        custom_mask = self._custom_mask(backend, mask, in_capture=False)
+
+        self.assertIs(custom_mask, backend.cuda_graph_custom_mask)
+        self.assertEqual(custom_mask[:_MASK_LEN].tolist(), mask.tolist())
+        self.assertFalse(custom_mask[_MASK_LEN:].any())
+
+    def test_missing_mask_stays_none_without_dspark(self):
+        backend = _dense_verify_backend(dspark=False)
+        self.assertIsNone(self._custom_mask(backend, None, in_capture=False))
+
+    def test_dspark_flag_follows_the_speculative_algorithm(self):
+        flags = {
+            algorithm: _init_mha_backend("nhd", algorithm)._dspark_verify
+            for algorithm in ("DSPARK", "EAGLE", None)
+        }
+        self.assertEqual(flags, {"DSPARK": True, "EAGLE": False, None: False})
 
 
 if __name__ == "__main__":

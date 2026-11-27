@@ -791,6 +791,12 @@ class AiterAttnBackend(AttentionBackend):
         self.is_multimodal = model_runner.model_config.is_multimodal
         self.num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.speculative_num_steps = get_spec().speculative_num_steps
+        # DSpark verify never builds a custom_mask; see _apply_cuda_graph_metadata.
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        self._dspark_verify = SpeculativeAlgorithm.from_string(
+            get_spec().speculative_algorithm
+        ).is_dspark()
         self.topk = topk
         self.num_head = (
             model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
@@ -4385,10 +4391,17 @@ class AiterAttnBackend(AttentionBackend):
                         verify_seqlen_k_i32=verify_seqlen_k_i32,
                     )
                 else:
-                    custom_mask = self.cuda_graph_custom_mask
-                    custom_mask[: spec_info.custom_mask.shape[0]] = (
-                        spec_info.custom_mask
-                    )
+                    # Pick None from config, not the per-call tensor: capture passes
+                    # a dummy non-None mask, and keying on it would bake
+                    # USE_CUSTOM_MASK=True into the graph while replay reads a
+                    # stale buffer. DSpark replay always passes None.
+                    if self._dspark_verify or spec_info.custom_mask is None:
+                        custom_mask = None
+                    else:
+                        custom_mask = self.cuda_graph_custom_mask
+                        custom_mask[: spec_info.custom_mask.shape[0]] = (
+                            spec_info.custom_mask
+                        )
                     seq_mask_len = max_q_len * (seq_lens + max_q_len)
                     mask_indptr = self.mask_indptr[: bs + 1]
                     mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
